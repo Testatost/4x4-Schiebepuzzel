@@ -1,3 +1,4 @@
+// solver-worker.js
 /* eslint-disable no-restricted-globals */
 
 // =====================================================
@@ -5,6 +6,7 @@
 // - Additive Pattern Databases (cost-splitting via 0-1 BFS)
 // - IDA* search with PDB heuristic
 // - IndexedDB cache for PDBs
+// - maxDepth support (limits g in search)
 // =====================================================
 
 const N = 4;
@@ -23,8 +25,7 @@ const NEIGHBORS = Array.from({ length: 16 }, (_, idx) => {
     return out;
 });
 
-// PATTERNS (additive): 4-4-4-3 split (fast + moderate memory)
-// Each PDB includes BLANK + pattern tiles
+// PATTERNS (additive): 4-4-4-3 split
 const PATTERNS = [
     [1,2,3,4],
 [5,6,7,8],
@@ -64,7 +65,10 @@ onmessage = async (ev) => {
         if (msg.type === "solve") {
             CANCELLED = false;
             const start = msg.state;
-            const moves = await solve(start);
+            const maxDepth = Number.isFinite(msg.maxDepth) ? Math.floor(msg.maxDepth) : 60;
+
+            const moves = await solve(start, maxDepth);
+
             if (CANCELLED) {
                 postMessage({ type: "solved", status: "cancelled", moves: null });
             } else if (!moves) {
@@ -74,7 +78,12 @@ onmessage = async (ev) => {
             }
         }
     }catch(err){
-        postMessage({ type: "solved", status: "fail", moves: null, error: String(err?.message || err) });
+        const em = String(err?.message || err);
+        if (em === "CANCELLED") {
+            postMessage({ type: "solved", status: "cancelled", moves: null });
+        } else {
+            postMessage({ type: "solved", status: "fail", moves: null, error: em });
+        }
     }
 };
 
@@ -147,8 +156,6 @@ function permCount(n, k){
     return out;
 }
 
-// Rank a partial permutation of length m (positions are integers 0..15, all distinct)
-// identical to your Python idea: count unused < p, multiply by remaining permutations.
 function rankPartialPerm(positions, n=16){
     const m = positions.length;
     const used = new Uint8Array(n);
@@ -175,7 +182,6 @@ function patternKey(pattern){
 // 0-1 BFS PDB Builder
 // ------------------------------
 function dequeCreate(cap=1<<20){
-    // simple deque using arrays and head index
     return { a: new Array(cap), head: 0, tail: 0, cap };
 }
 function dequeLen(d){ return d.tail - d.head; }
@@ -183,7 +189,6 @@ function dequePushBack(d, x){
     d.a[d.tail % d.cap] = x;
     d.tail++;
     if (d.tail - d.head > d.cap - 4) {
-        // grow
         const newCap = d.cap * 2;
         const na = new Array(newCap);
         const len = dequeLen(d);
@@ -203,15 +208,12 @@ function dequePopFront(d){
 }
 
 function buildPDB(pattern){
-    // pattern tiles length k; we include blank => m = 1 + k
     const m = 1 + pattern.length;
     const size = permCount(16, m);
 
-    // distances in Uint16, 65535 = INF
     const dist = new Uint16Array(size);
     dist.fill(65535);
 
-    // goal positions
     const blankGoal = GOAL_POS[0];
     const tileGoals = pattern.map(t => GOAL_POS[t]);
     const startPositions = [blankGoal, ...tileGoals];
@@ -243,13 +245,11 @@ function buildPDB(pattern){
 
             const tileIndex = inPatternPos[nb];
             if (tileIndex !== -1) {
-                // moved tile is in pattern => cost 1, swap blank with tileIndex
                 const tmp = newPos[0];
                 newPos[0] = newPos[tileIndex];
                 newPos[tileIndex] = tmp;
                 stepCost = 1;
             } else {
-                // moved irrelevant tile => cost 0, only blank changes
                 newPos[0] = nb;
                 stepCost = 0;
             }
@@ -264,10 +264,9 @@ function buildPDB(pattern){
         }
 
         visited++;
-        if ((visited & 0x3FFFF) === 0) { // every ~262k
+        if ((visited & 0x3FFFF) === 0) {
             const secs = ((performance.now() - t0) / 1000).toFixed(1);
             progress(`PDB ${pattern.join(",")} bauen… visited=${visited.toLocaleString()} | ~${secs}s`);
-            // yield a bit (worker still can yield)
         }
     }
 
@@ -280,12 +279,10 @@ async function loadOrBuildPDB(pattern){
     const m = 1 + pattern.length;
     const expectedSize = permCount(16, m);
 
-    // Try load
     const rec = await dbGet(key);
     if (rec && rec.buffer) {
         try{
-            const buf = rec.buffer;
-            const arr = new Uint16Array(buf);
+            const arr = new Uint16Array(rec.buffer);
             if (arr.length === expectedSize) {
                 progress(`PDB ${pattern.join(",")} Cache geladen.`);
                 return arr;
@@ -295,17 +292,14 @@ async function loadOrBuildPDB(pattern){
 
     progress(`PDB ${pattern.join(",")} Cache fehlt → baue neu…`);
     const dist = buildPDB(pattern);
-
-    // Store as ArrayBuffer (copy)
     await dbPut(key, dist.buffer.slice(0));
-
     return dist;
 }
 
 // ------------------------------
 // Heuristic using additive PDBs
 // ------------------------------
-let PDBS = null; // array of {pattern, dist}
+let PDBS = null;
 async function ensurePDBs(){
     if (PDBS) return PDBS;
     PDBS = [];
@@ -316,12 +310,12 @@ async function ensurePDBs(){
         const dist = await loadOrBuildPDB(pattern);
         PDBS.push({ pattern, dist });
     }
+
     progress("Alle PDBs bereit.");
     return PDBS;
 }
 
 function pdbHeuristic(stateArr){
-    // pos_of[tile] = index
     const posOf = new Int8Array(16);
     for(let i=0;i<16;i++) posOf[stateArr[i]] = i;
     const blankPos = posOf[0];
@@ -338,9 +332,9 @@ function pdbHeuristic(stateArr){
 }
 
 // ------------------------------
-// IDA* with PDB heuristic
+// IDA* with PDB heuristic (+ maxDepth)
 // ------------------------------
-async function idaStarSolvePDB(start){
+async function idaStarSolvePDB(start, maxDepth=60){
     const goalKey = GOAL.join(",");
     const startKey = start.join(",");
     if (startKey === goalKey) return [];
@@ -348,12 +342,10 @@ async function idaStarSolvePDB(start){
     let nodes = 0;
     let lastPing = performance.now();
 
-    const startH = pdbHeuristic(start);
-    let bound = startH;
+    let bound = pdbHeuristic(start);
 
     function swapInPlace(a,i,j){ const t=a[i]; a[i]=a[j]; a[j]=t; }
 
-    // order moves by heuristic
     function orderedMoves(state, blankIdx, prevBlank){
         const cand = [];
         for(const nb of NEIGHBORS[blankIdx]){
@@ -371,6 +363,9 @@ async function idaStarSolvePDB(start){
     async function search(state, g, bound, blankIdx, prevBlank, path){
         if (CANCELLED) throw new Error("CANCELLED");
 
+        // <-- max depth cutoff
+        if (g > maxDepth) return { found:false, next: Infinity };
+
         const h = pdbHeuristic(state);
         const f = g + h;
         if (f > bound) return { found:false, next:f };
@@ -380,8 +375,7 @@ async function idaStarSolvePDB(start){
         const now = performance.now();
         if (now - lastPing > 200) {
             lastPing = now;
-            progress(`Suche… bound=${bound} | Tiefe=${g} | Knoten=${nodes.toLocaleString()}`);
-            // yield
+            progress(`Suche… bound=${bound} | Tiefe=${g}/${maxDepth} | Knoten=${nodes.toLocaleString()}`);
             await new Promise(r=>setTimeout(r,0));
             if (CANCELLED) throw new Error("CANCELLED");
         }
@@ -407,7 +401,8 @@ async function idaStarSolvePDB(start){
 
     while(true){
         if (CANCELLED) throw new Error("CANCELLED");
-        progress(`IDA* Iteration… bound=${bound}`);
+        progress(`IDA* Iteration… bound=${bound} | maxDepth=${maxDepth}`);
+
         const state = start.slice();
         const blankIdx = state.indexOf(0);
         const path = [];
@@ -417,7 +412,10 @@ async function idaStarSolvePDB(start){
             progress(`Lösung gefunden! Züge=${path.length}`);
             return path.slice();
         }
+
+        // If maxDepth cutoff prevented any next bound, stop
         if (!Number.isFinite(res.next)) return null;
+
         bound = res.next;
     }
 }
@@ -425,13 +423,8 @@ async function idaStarSolvePDB(start){
 // ------------------------------
 // Solve pipeline
 // ------------------------------
-async function solve(start){
+async function solve(start, maxDepth){
     await ensurePDBs();
-    progress("Starte IDA* (PDB) …");
-    try{
-        return await idaStarSolvePDB(start);
-    }catch(err){
-        if (String(err?.message || err) === "CANCELLED") return null;
-        throw err;
-    }
+    progress(`Starte IDA* (PDB) … maxDepth=${maxDepth}`);
+    return await idaStarSolvePDB(start, maxDepth);
 }
